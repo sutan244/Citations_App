@@ -1,359 +1,392 @@
-from flask import Flask, request, render_template_string, send_file, abort, url_for, Response
-import tempfile, os, time, random, uuid, threading, queue, json
-import pandas as pd
-import json, queue as _queue
-from scholarly import scholarly, ProxyGenerator
-
-app = Flask(__name__)
-
-HTML_FORM = """
-<!doctype html>
-<title>Scholar -> Excel</title>
-<h2>Google Scholar -> Excel export</h2>
-<form id="frm" method="post" action="/start">
-  Scholar ID (e.g. EJBNDEcAAAAJ): <input name=scholar_id required><br>
-  Number of Year columns (e.g. 16): <input name=num_years value="16" required><br>
-  <input type=submit value="Generate Excel">
-</form>
-<p id="note">Note: scraping can take time; progress will appear below.</p>
-<div id="progress" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;height:300px;overflow:auto;"></div>
-<script>
-document.getElementById('frm').onsubmit = function(e){
-  e.preventDefault();
-  var form = e.target;
-  var data = new FormData(form);
-  fetch(form.action, {method: 'POST', body: data})
-    .then(r => {
-      if (!r.ok) return r.text().then(t => { throw new Error(t) });
-      return r.json();
-    })
-    .then(j => {
-      var jobId = j.job_id;
-      var evt = new EventSource('/events/' + jobId);
-      var prog = document.getElementById('progress');
-      evt.onmessage = function(ev){
-        try {
-          var obj = JSON.parse(ev.data);
-        } catch(e){
-          prog.textContent += "\\n" + ev.data;
-          prog.scrollTop = prog.scrollHeight;
-          return;
-        }
-        if (obj.type === 'log') {
-          prog.textContent += obj.msg + "\\n";
-          prog.scrollTop = prog.scrollHeight;
-        } else if (obj.type === 'done') {
-          prog.textContent += "DONE. Download: " + obj.url + "\\n";
-          prog.scrollTop = prog.scrollHeight;
-          evt.close();
-        } else if (obj.type === 'error') {
-          prog.textContent += "ERROR: " + obj.msg + "\\n";
-          prog.scrollTop = prog.scrollHeight;
-          evt.close();
-        } else if (obj.type === 'heartbeat') {
-          // optional: ignore or show minimal heartbeat indicator
-        }
-      };
-      evt.onerror = function(e){
-        prog.textContent += "\\n[EventSource error]";
-        evt.close();
-      };
-    })
-    .catch(err => {
-      document.getElementById('progress').textContent = 'Start error: ' + err.message;
-    });
-};
-</script>
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+A simple web app to fetch Google Scholar publications and export to Excel.
+The app automatically determines the maximum number of year columns needed.
+"""
+import os
+import time
+import random
+import threading
+import uuid
+import pandas as pd
+from scholarly import scholarly
+from flask import Flask, request, render_template_string, redirect, url_for, send_file
 
-# Small helper RNG delays
+# Create app and temp directory
+app = Flask(__name__)
+if not os.path.exists("tmp"):
+    os.makedirs("tmp")
+
+# Storage for job status and results
+JOBS = {}
+
+# Constants
 DELAY_MIN = 0.6
 DELAY_MAX = 1.4
-def rnd(a=DELAY_MIN, b=DELAY_MAX):
-    return a + random.random() * (b - a)
 
-# Logging queues per job
-JOB_QUEUES = {}  # job_id -> Queue
+# Simple HTML template
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Google Scholar to Excel</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        input, button { margin: 10px 0; padding: 8px; }
+        input[type="text"] { width: 100%; }
+        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; padding: 10px 15px; }
+        button:hover { background-color: #45a049; }
+        .status { white-space: pre-wrap; background: #f0f0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Google Scholar → Excel Export</h1>
 
-def push_log(job_id, msg):
-    q = JOB_QUEUES.get(job_id)
-    if q:
-        q.put(("log", msg))
+    <form method="POST" action="/start">
+        <div>
+            <label>Scholar ID (e.g., EJBNDEcAAAAJ):</label>
+            <input type="text" name="scholar_id" value="EJBNDEcAAAAJ" required>
+        </div>
+        <p><small>The number of year columns will be determined automatically based on citation data.</small></p>
+        <button type="submit">Generate Excel</button>
+    </form>
 
-def push_error(job_id, msg):
-    q = JOB_QUEUES.get(job_id)
-    if q:
-        q.put(("error", msg))
+    {% if job_id %}
+    <h2>Job Status</h2>
+    <div class="status" id="status">{{ status }}</div>
 
-def push_done(job_id, download_url):
-    q = JOB_QUEUES.get(job_id)
-    if q:
-        q.put(("done", download_url))
+    {% if download_url %}
+    <p class="success">✅ Job completed! <a href="{{ download_url }}">Download Excel File</a></p>
+    {% elif error %}
+    <p class="error">❌ Error: {{ error }}</p>
+    {% else %}
+    <p>Job in progress... This page will refresh automatically every 3 seconds.</p>
+    <script>
+        setTimeout(function() { 
+            window.location.href = "/status/{{ job_id }}";
+        }, 3000);
+    </script>
+    {% endif %}
+    {% endif %}
+</body>
+</html>
+"""
 
-# Helpers (same as your script)
-def normalize_cites_per_year(pub_filled):
-    cp = {}
-    if not isinstance(pub_filled, dict):
-        return cp
-    cand_keys = []
-    cand_keys.append(pub_filled.get("cites_per_year"))
-    cand_keys.append(pub_filled.get("citesPerYear"))
-    if isinstance(pub_filled.get("bib"), dict):
-        cand_keys.append(pub_filled["bib"].get("cites_per_year"))
-        cand_keys.append(pub_filled["bib"].get("citesPerYear"))
-    for cand in cand_keys:
-        if isinstance(cand, dict):
-            for k, v in cand.items():
+
+def random_delay(min_delay=DELAY_MIN, max_delay=DELAY_MAX):
+    return min_delay + random.random() * (max_delay - min_delay)
+
+
+def extract_from_bib(bib, keys, default=""):
+    """Extract value from bibliography using multiple possible keys"""
+    if not isinstance(bib, dict):
+        return default
+
+    for key in keys:
+        if key in bib and bib[key]:
+            return bib[key]
+    return default
+
+
+def get_cites_per_year(pub):
+    """Extract and normalize citation counts per year"""
+    if not isinstance(pub, dict):
+        return {}
+
+    # Try different possible locations for citation data
+    for key in ["cites_per_year", "citesPerYear"]:
+        if key in pub and isinstance(pub[key], dict):
+            result = {}
+            for year, count in pub[key].items():
                 try:
-                    ky = int(k)
-                except Exception:
+                    result[int(year)] = int(count)
+                except (ValueError, TypeError):
+                    pass
+            return result
+
+    # Check if it's in the bib section
+    if isinstance(pub.get("bib"), dict):
+        for key in ["cites_per_year", "citesPerYear"]:
+            if key in pub["bib"] and isinstance(pub["bib"][key], dict):
+                result = {}
+                for year, count in pub["bib"][key].items():
                     try:
-                        ky = int(str(k).strip())
-                    except Exception:
-                        continue
-                try:
-                    cp[ky] = int(v)
-                except Exception:
-                    continue
-            break
-    return cp
+                        result[int(year)] = int(count)
+                    except (ValueError, TypeError):
+                        pass
+                return result
 
-def extract_authors(bib):
-    if not isinstance(bib, dict):
-        return ""
-    return bib.get("author", "") or bib.get("authors", "") or ""
+    return {}
 
-def extract_journal(bib):
-    if not isinstance(bib, dict):
-        return ""
-    for k in ("journal", "venue", "publisher", "booktitle", "journal_title"):
-        if k in bib and bib[k]:
-            return bib[k]
-    return ""
 
-def extract_pub_year(bib):
-    if not isinstance(bib, dict):
-        return None
-    for k in ("pub_year", "year", "publication_year"):
-        if k in bib and bib[k]:
-            try:
-                return int(bib[k])
-            except Exception:
-                try:
-                    return int(str(bib[k]).strip())
-                except:
-                    return None
-    return None
+def scrape_scholar(scholar_id, job_id):
+    """Main function to scrape Google Scholar and generate Excel file"""
+    logs = []
 
-def build_dataframe(profile_user, num_year_cols, log_fn=None, use_proxy=False):
-    if use_proxy:
-        try:
-            pg = ProxyGenerator()
-            scholarly.use_proxy(pg)
-        except Exception:
-            pass
+    def log(message):
+        logs.append(message)
+        JOBS[job_id]["status"] = "\n".join(logs)
 
-    if log_fn:
-        log_fn(f"Resolving author id: {profile_user} ...")
     try:
-        author = scholarly.search_author_id(profile_user)
-    except Exception:
-        author = None
-        if log_fn:
-            log_fn("Direct id lookup failed; performing search_author...")
+        log(f"Starting job for Scholar ID: {scholar_id}")
+        log("Searching for author profile...")
+
+        # Find author
         try:
-            for a in scholarly.search_author(profile_user):
+            author = scholarly.search_author_id(scholar_id)
+        except Exception as e:
+            log(f"Error finding author by ID: {e}")
+            log("Trying alternative search method...")
+            author = None
+            for a in scholarly.search_author(scholar_id):
                 author = a
                 break
-        except Exception as e:
-            if log_fn:
-                log_fn(f"search_author error: {e}")
-            author = None
 
-    if not author:
-        raise RuntimeError("Author not found.")
+        if not author:
+            raise Exception("Author profile not found")
 
-    if log_fn:
-        log_fn("Filling author (publications)...")
-    author = scholarly.fill(author, sections=["publications"])
-    pubs = author.get("publications", []) or []
-    if log_fn:
-        log_fn(f"Found {len(pubs)} publications; fetching details...")
+        # Get publications
+        log("Found author. Retrieving publication list...")
+        author = scholarly.fill(author, sections=["publications"])
+        pubs = author.get("publications", []) or []
+        log(f"Found {len(pubs)} publications. Processing details...")
 
-    rows = []
-    for idx, pub in enumerate(pubs, start=1):
-        if log_fn:
-            log_fn(f"[{idx}/{len(pubs)}] fetching publication details...")
-        try:
-            pub_filled = scholarly.fill(pub)
-        except Exception as e:
-            if log_fn:
-                log_fn(f"first fill failed: {e}; retrying shortly...")
-            time.sleep(rnd(0.2, 0.6))
+        if not pubs:
+            raise Exception("No publications found for this author")
+
+        # Process each publication and collect citation data
+        rows = []
+        all_citation_years = set()  # To track all years with citations across all publications
+        pub_citation_data = []  # To store citation data for each publication
+
+        for idx, pub in enumerate(pubs, start=1):
+            title_preview = pub.get("bib", {}).get("title", "Unknown")[:50]
+            log(f"[{idx}/{len(pubs)}] Processing: {title_preview}...")
+
             try:
                 pub_filled = scholarly.fill(pub)
-            except Exception as e2:
-                if log_fn:
-                    log_fn(f"second fill failed: {e2}; skipping publication.")
-                continue
+            except Exception as e:
+                log(f"  ⚠️ Error retrieving details: {e}, retrying once...")
+                time.sleep(random_delay(0.2, 0.6))
+                try:
+                    pub_filled = scholarly.fill(pub)
+                except Exception as e2:
+                    log(f"  ❌ Failed again: {e2}, skipping publication.")
+                    continue
 
-        bib = pub_filled.get("bib", {}) if isinstance(pub_filled, dict) else {}
-        title = bib.get("title") or pub_filled.get("title") or ""
-        authors = extract_authors(bib)
-        journal = extract_journal(bib)
-        pub_year = extract_pub_year(bib)
-        num_citations = pub_filled.get("num_citations", pub_filled.get("citedby", ""))
+            # Extract basic publication details
+            bib = pub_filled.get("bib", {}) if isinstance(pub_filled, dict) else {}
+            title = extract_from_bib(bib, ["title"], "")
+            if not title and isinstance(pub_filled, dict):
+                title = pub_filled.get("title", "")
 
-        cp = normalize_cites_per_year(pub_filled)
-        start_year = None
-        if cp:
-            years_with_cites = sorted([y for y, c in cp.items() if isinstance(c, int) and c != 0])
-            if years_with_cites:
-                start_year = years_with_cites[0]
+            authors = extract_from_bib(bib, ["author", "authors"], "")
+            journal = extract_from_bib(bib, ["journal", "venue", "publisher", "booktitle", "journal_title"], "")
+
+            # Extract publication year
+            pub_year = None
+            for year_key in ["pub_year", "year", "publication_year"]:
+                if year_key in bib and bib[year_key]:
+                    try:
+                        pub_year = int(bib[year_key])
+                        break
+                    except (ValueError, TypeError):
+                        try:
+                            pub_year = int(str(bib[year_key]).strip())
+                            break
+                        except:
+                            pass
+
+            # Get citation counts by year
+            citations_by_year = get_cites_per_year(pub_filled)
+
+            # Track all years with citations
+            all_citation_years.update(citations_by_year.keys())
+
+            # Find the first year with citations
+            start_year = None
+            if citations_by_year:
+                years_with_citations = [y for y, c in citations_by_year.items() if c > 0]
+                if years_with_citations:
+                    start_year = min(years_with_citations)
+                else:
+                    # If no citations, use earliest year in the data
+                    start_year = min(citations_by_year.keys()) if citations_by_year else None
+
+            # Get total citation count
+            total_citations = pub_filled.get("num_citations", "")
+            if total_citations == "":
+                total_citations = pub_filled.get("citedby", "")
+
+            total_from_years = sum(c for c in citations_by_year.values() if isinstance(c, int))
+
+            if total_citations == "":
+                total_citations = total_from_years
             else:
-                start_year = min(cp.keys())
+                try:
+                    total_citations = int(total_citations)
+                except (ValueError, TypeError):
+                    total_citations = total_from_years
 
-        year_cols = {}
-        total_from_yearcols = 0
-        if start_year:
-            for i in range(1, num_year_cols + 1):
-                y = start_year + (i - 1)
-                val = cp.get(y, "")
-                if isinstance(val, int):
-                    total_from_yearcols += val
-                year_cols[f"Year {i}"] = val if val != "" else ""
+            # Store the basic publication data and citation info for later
+            pub_data = {
+                "Title": title,
+                "Authors": authors,
+                "Journal": journal,
+                "Year of publication": pub_year if pub_year else "",
+                "start_year": start_year,
+                "citations_by_year": citations_by_year,
+                "TOTAL citations": total_citations
+            }
+            pub_citation_data.append(pub_data)
+
+            log(f"  ✓ Processed: {title[:50]}... (total citations: {total_citations})")
+            time.sleep(random_delay())
+
+        if not pub_citation_data:
+            raise Exception("Failed to collect any publication data")
+
+        # Determine the maximum span of years needed
+        log("Analyzing citation data to determine optimal year columns...")
+
+        if all_citation_years:
+            min_citation_year = min(all_citation_years)
+            max_citation_year = max(all_citation_years)
+            year_span = max_citation_year - min_citation_year + 1
+            log(f"Citation data spans from {min_citation_year} to {max_citation_year} ({year_span} years)")
+
+            # Calculate the maximum number of consecutive years needed for any publication
+            max_consecutive_years = 0
+            for pub_data in pub_citation_data:
+                if pub_data["start_year"]:
+                    years_since_first_citation = max(0, max_citation_year - pub_data["start_year"] + 1)
+                    max_consecutive_years = max(max_consecutive_years, years_since_first_citation)
+
+            # Add a small buffer for future citations
+            num_years = max(max_consecutive_years + 2, 5)  # At least 5 columns, plus 2 extra for future
+            log(f"Using {num_years} year columns based on citation patterns")
         else:
-            for i in range(1, num_year_cols + 1):
-                year_cols[f"Year {i}"] = ""
+            # Fallback if no citation data is found
+            num_years = 10
+            log("No citation years found. Using default of 10 year columns")
 
-        try:
-            total_citations = int(num_citations) if num_citations not in (None, "") else total_from_yearcols
-        except Exception:
-            total_citations = total_from_yearcols
+        # Now build the final dataset with the determined number of year columns
+        rows = []
+        for pub_data in pub_citation_data:
+            row = {
+                "Title": pub_data["Title"],
+                "Authors": pub_data["Authors"],
+                "Journal": pub_data["Journal"],
+                "Year of publication": pub_data["Year of publication"],
+                "TOTAL citations": pub_data["TOTAL citations"]
+            }
 
-        row = {
-            "Title": title,
-            "Authors": authors,
-            "Journal": journal,
-            "Year of publication": pub_year if pub_year else "",
-        }
-        for i in range(1, num_year_cols + 1):
-            row[f"Year {i}"] = year_cols.get(f"Year {i}", "")
-        row["TOTAL citations"] = total_citations
-        rows.append(row)
+            # Add the year columns
+            start_year = pub_data["start_year"]
+            citations_by_year = pub_data["citations_by_year"]
 
-        time.sleep(rnd())
+            if start_year:
+                for i in range(1, num_years + 1):
+                    year = start_year + (i - 1)
+                    row[f"Year {i}"] = citations_by_year.get(year, "")
+            else:
+                for i in range(1, num_years + 1):
+                    row[f"Year {i}"] = ""
 
-    if not rows:
-        raise RuntimeError("No publications found or scraping failed.")
+            rows.append(row)
 
-    cols = ["Title", "Authors", "Journal", "Year of publication"] + [f"Year {i}" for i in range(1, num_year_cols + 1)] + ["TOTAL citations"]
-    df = pd.DataFrame(rows)
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[cols]
-    return df
+        # Create DataFrame and Excel file
+        log(f"Creating Excel file with {num_years} year columns...")
+        cols = ["Title", "Authors", "Journal", "Year of publication"] + \
+               [f"Year {i}" for i in range(1, num_years + 1)] + \
+               ["TOTAL citations"]
 
-@app.route("/", methods=["GET"])
+        df = pd.DataFrame(rows)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = ""
+
+        df = df[cols]  # Reorder columns
+
+        filename = f"tmp/{job_id}.xlsx"
+        df.to_excel(filename, index=False)
+
+        log(f"✅ Excel file created successfully with {len(rows)} publications and {num_years} year columns.")
+        JOBS[job_id]["done"] = True
+        JOBS[job_id]["filename"] = filename
+
+    except Exception as e:
+        log(f"❌ Error: {str(e)}")
+        JOBS[job_id]["error"] = str(e)
+
+
+# Routes
+@app.route('/')
 def index():
-    return render_template_string(HTML_FORM)
+    return render_template_string(HTML)
 
-@app.route("/start", methods=["POST"])
-def start():
-    scholar_id = request.form.get("scholar_id", "").strip()
-    try:
-        num_years = int(request.form.get("num_years", "16"))
-        if num_years < 1 or num_years > 50:
-            raise ValueError
-    except Exception:
-        return "Invalid number of years.", 400
-    if not scholar_id:
-        return "scholar_id required", 400
+
+@app.route('/start', methods=['POST'])
+def start_job():
+    scholar_id = request.form.get('scholar_id')
 
     job_id = str(uuid.uuid4())
-    q = queue.Queue()
-    JOB_QUEUES[job_id] = q
+    JOBS[job_id] = {
+        "status": "Initializing...",
+        "done": False,
+        "error": None,
+        "filename": None
+    }
 
-    def log_fn(msg):
-        push_log(job_id, msg)
+    # Start the scraping in a background thread
+    thread = threading.Thread(
+        target=scrape_scholar,
+        args=(scholar_id, job_id)
+    )
+    thread.daemon = True
+    thread.start()
 
-    def worker():
-        try:
-            push_log(job_id, f"Job started for {scholar_id}")
-            df = build_dataframe(scholar_id, num_years, log_fn=log_fn, use_proxy=False)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            tmp_name = tmp.name
-            tmp.close()
-            df.to_excel(tmp_name, index=False)
-            download_url = url_for('download', job_id=job_id, _external=True)
-            JOB_QUEUES[job_id].tmp_path = tmp_name
-            push_done(job_id, download_url)
-            push_log(job_id, "File ready.")
-        except Exception as e:
-            push_error(job_id, str(e))
-        finally:
-            time.sleep(0.5)
-            q.put(("__finished__", None))
+    return redirect(url_for('job_status', job_id=job_id))
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
 
-    return {"job_id": job_id}, 200
-
-@app.route("/events/<job_id>")
-def events(job_id):
-    if job_id not in JOB_QUEUES:
-        return abort(404)
-    q = JOB_QUEUES[job_id]
-
-    def gen():
-        try:
-            while True:
-                try:
-                    item = q.get(timeout=15)
-                except _queue.Empty:
-                    # heartbeat to keep connection alive through proxies
-                    hb = json.dumps({"type": "heartbeat"})
-                    yield f"{hb}\n\n"
-                    continue
-
-                if not item:
-                    continue
-                if item[0] == "__finished__":
-                    break
-                typ, payload = item
-                if typ == "log":
-                    yield f"{json.dumps({'type':'log','msg':payload})}\n\n"
-                elif typ == "done":
-                    yield f"{json.dumps({'type':'done','url':payload})}\n\n"
-                elif typ == "error":
-                    yield f"{json.dumps({'type':'error','msg':payload})}\n\n"
-        finally:
-            pass
-
-    resp = Response(gen(), mimetype="text/event-stream")
-    resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Accel-Buffering"] = "no"   # disable buffering for nginx-like proxies
-    return resp
-
-@app.route("/download/<job_id>")
-def download(job_id):
-    q = JOB_QUEUES.get(job_id)
-    if not q:
+@app.route('/status/<job_id>')
+def job_status(job_id):
+    if job_id not in JOBS:
         return "Job not found", 404
-    tmp_path = getattr(q, "tmp_path", None)
-    if not tmp_path or not os.path.exists(tmp_path):
-        return "File not available", 404
-    def cleanup(path):
-        try:
-            time.sleep(5)
-            os.unlink(path)
-            JOB_QUEUES.pop(job_id, None)
-        except Exception:
-            pass
-    threading.Thread(target=cleanup, args=(tmp_path,), daemon=True).start()
-    return send_file(tmp_path, as_attachment=True, download_name=f"{job_id}_scholar.xlsx")
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    job = JOBS[job_id]
+    download_url = None
+
+    if job["done"] and job["filename"]:
+        download_url = url_for('download_file', job_id=job_id)
+
+    return render_template_string(
+        HTML,
+        job_id=job_id,
+        status=job["status"],
+        error=job["error"],
+        download_url=download_url
+    )
+
+
+@app.route('/download/<job_id>')
+def download_file(job_id):
+    if job_id not in JOBS or not JOBS[job_id].get("filename"):
+        return "File not found", 404
+
+    filename = JOBS[job_id]["filename"]
+    if not os.path.exists(filename):
+        return "File was deleted or never created", 404
+
+    return send_file(
+        filename,
+        as_attachment=True,
+        download_name=f"scholar_export_{job_id[:8]}.xlsx"
+    )
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
