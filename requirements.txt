@@ -1,0 +1,5 @@
+Flask
+pandas
+scholarly
+openpyxl
+gunicorn
