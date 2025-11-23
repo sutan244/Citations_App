@@ -11,7 +11,7 @@ import threading
 import uuid
 import pandas as pd
 from scholarly import scholarly
-from flask import Flask, request, render_template_string, redirect, url_for, send_file
+from flask import Flask, request, render_template_string, redirect, url_for, send_file, jsonify
 
 # Create app and temp directory
 app = Flask(__name__)
@@ -40,7 +40,28 @@ HTML = """
         .status { white-space: pre-wrap; background: #f0f0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; }
         .error { color: red; }
         .success { color: green; }
+        .stop-btn { background-color: #f44336; }
+        .stop-btn:hover { background-color: #d32f2f; }
     </style>
+    <script>
+        function stopJob(jobId) {
+            fetch('/stop/' + jobId, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('stop-btn').disabled = true;
+                    document.getElementById('stop-btn').innerHTML = 'Stopping...';
+                    // Refresh the page after a short delay to see the updated status
+                    setTimeout(function() { 
+                        window.location.href = "/status/" + jobId;
+                    }, 1000);
+                }
+            });
+            return false;
+        }
+    </script>
 </head>
 <body>
     <h1>Google Scholar → Excel Export</h1>
@@ -62,8 +83,11 @@ HTML = """
     <p class="success">✅ Job completed! <a href="{{ download_url }}">Download Excel File</a></p>
     {% elif error %}
     <p class="error">❌ Error: {{ error }}</p>
+    {% elif cancelled %}
+    <p class="error">⚠️ Job was cancelled.</p>
     {% else %}
     <p>Job in progress... This page will refresh automatically every 3 seconds.</p>
+    <button id="stop-btn" class="stop-btn" onclick="return stopJob('{{ job_id }}')">Stop Job</button>
     <script>
         setTimeout(function() { 
             window.location.href = "/status/{{ job_id }}";
@@ -163,6 +187,11 @@ def scrape_scholar(scholar_id, job_id):
         pub_citation_data = []  # To store citation data for each publication
 
         for idx, pub in enumerate(pubs, start=1):
+            # Check if job has been cancelled
+            if JOBS[job_id].get("cancelled", False):
+                log("⚠️ Job cancelled by user.")
+                return
+                
             title_preview = pub.get("bib", {}).get("title", "Unknown")[:50]
             log(f"[{idx}/{len(pubs)}] Processing: {title_preview}...")
 
@@ -245,6 +274,11 @@ def scrape_scholar(scholar_id, job_id):
 
             log(f"  ✓ Processed: {title[:50]}... (total citations: {total_citations})")
             time.sleep(random_delay())
+
+        # Check if job was cancelled during processing
+        if JOBS[job_id].get("cancelled", False):
+            log("⚠️ Job cancelled by user.")
+            return
 
         if not pub_citation_data:
             raise Exception("Failed to collect any publication data")
@@ -338,7 +372,8 @@ def start_job():
         "status": "Initializing...",
         "done": False,
         "error": None,
-        "filename": None
+        "filename": None,
+        "cancelled": False
     }
 
     # Start the scraping in a background thread
@@ -368,8 +403,24 @@ def job_status(job_id):
         job_id=job_id,
         status=job["status"],
         error=job["error"],
-        download_url=download_url
+        download_url=download_url,
+        cancelled=job.get("cancelled", False)
     )
+
+
+@app.route('/stop/<job_id>', methods=['POST'])
+def stop_job(job_id):
+    if job_id not in JOBS:
+        return jsonify({"success": False, "message": "Job not found"}), 404
+    
+    # Mark the job as cancelled
+    JOBS[job_id]["cancelled"] = True
+    
+    # Add a message to the status log
+    current_status = JOBS[job_id]["status"]
+    JOBS[job_id]["status"] = current_status + "\n⚠️ Cancellation requested. Stopping job..."
+    
+    return jsonify({"success": True, "message": "Job cancellation requested"})
 
 
 @app.route('/download/<job_id>')
