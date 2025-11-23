@@ -1,6 +1,7 @@
 from flask import Flask, request, render_template_string, send_file, abort, url_for, Response
 import tempfile, os, time, random, uuid, threading, queue, json
 import pandas as pd
+import json, queue as _queue
 from scholarly import scholarly, ProxyGenerator
 
 app = Flask(__name__)
@@ -311,7 +312,7 @@ def events(job_id):
             while True:
                 try:
                     item = q.get(timeout=15)
-                except queue.Empty:
+                except _queue.Empty:
                     # heartbeat to keep connection alive through proxies
                     hb = json.dumps({"type": "heartbeat"})
                     yield f"{hb}\n\n"
@@ -333,7 +334,7 @@ def events(job_id):
 
     resp = Response(gen(), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["X-Accel-Buffering"] = "no"   # disable buffering for nginx-like proxies
     return resp
 
 @app.route("/download/<job_id>")
