@@ -1,5 +1,5 @@
-from flask import Flask, request, render_template_string, send_file, abort, url_for
-import tempfile, os, time, random, uuid, threading, queue
+from flask import Flask, request, render_template_string, send_file, abort, url_for, Response
+import tempfile, os, time, random, uuid, threading, queue, json
 import pandas as pd
 from scholarly import scholarly, ProxyGenerator
 
@@ -49,6 +49,8 @@ document.getElementById('frm').onsubmit = function(e){
           prog.textContent += "ERROR: " + obj.msg + "\\n";
           prog.scrollTop = prog.scrollHeight;
           evt.close();
+        } else if (obj.type === 'heartbeat') {
+          // optional: ignore or show minimal heartbeat indicator
         }
       };
       evt.onerror = function(e){
@@ -87,7 +89,7 @@ def push_done(job_id, download_url):
     if q:
         q.put(("done", download_url))
 
-# Helpers (as in your script)
+# Helpers (same as your script)
 def normalize_cites_per_year(pub_filled):
     cp = {}
     if not isinstance(pub_filled, dict):
@@ -279,20 +281,17 @@ def start():
         try:
             push_log(job_id, f"Job started for {scholar_id}")
             df = build_dataframe(scholar_id, num_years, log_fn=log_fn, use_proxy=False)
-            # write to temp file
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
             tmp_name = tmp.name
             tmp.close()
             df.to_excel(tmp_name, index=False)
             download_url = url_for('download', job_id=job_id, _external=True)
-            # store path for download
-            JOB_QUEUES[job_id].tmp_path = tmp_name  # attach attribute
+            JOB_QUEUES[job_id].tmp_path = tmp_name
             push_done(job_id, download_url)
             push_log(job_id, "File ready.")
         except Exception as e:
             push_error(job_id, str(e))
         finally:
-            # signal end by putting sentinel after short delay
             time.sleep(0.5)
             q.put(("__finished__", None))
 
@@ -310,24 +309,32 @@ def events(job_id):
     def gen():
         try:
             while True:
-                item = q.get()
+                try:
+                    item = q.get(timeout=15)
+                except queue.Empty:
+                    # heartbeat to keep connection alive through proxies
+                    hb = json.dumps({"type": "heartbeat"})
+                    yield f"{hb}\n\n"
+                    continue
+
                 if not item:
                     continue
                 if item[0] == "__finished__":
                     break
                 typ, payload = item
                 if typ == "log":
-                    yield f"{pd.io.json.dumps({'type':'log','msg':payload})}\n\n"
+                    yield f"{json.dumps({'type':'log','msg':payload})}\n\n"
                 elif typ == "done":
-                    yield f"{pd.io.json.dumps({'type':'done','url':payload})}\n\n"
+                    yield f"{json.dumps({'type':'done','url':payload})}\n\n"
                 elif typ == "error":
-                    yield f"{pd.io.json.dumps({'type':'error','msg':payload})}\n\n"
+                    yield f"{json.dumps({'type':'error','msg':payload})}\n\n"
         finally:
-            # cleanup queue entry after client disconnect/finished
-            # keep tmp_path for download until cleaned by download endpoint
             pass
 
-    return app.response_class(gen(), mimetype="text/event-stream")
+    resp = Response(gen(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
 @app.route("/download/<job_id>")
 def download(job_id):
@@ -337,12 +344,10 @@ def download(job_id):
     tmp_path = getattr(q, "tmp_path", None)
     if not tmp_path or not os.path.exists(tmp_path):
         return "File not available", 404
-    # serve file and schedule deletion
     def cleanup(path):
         try:
             time.sleep(5)
             os.unlink(path)
-            # remove job queue entry
             JOB_QUEUES.pop(job_id, None)
         except Exception:
             pass
