@@ -112,171 +112,244 @@ VIZ_HTML = """
     <style>
         body { font-family: Arial, sans-serif; padding: 20px; }
         h1 { margin-bottom: 20px; }
-        .controls { margin-bottom: 20px; }
+        .controls { margin-bottom: 20px; display: flex; align-items: center; gap: 15px;}
         #chart { width: 100%; height: 800px; }
-        select { padding: 10px; border-radius: 5px; border: 1px solid #ccc; }
+        select { padding: 10px; border-radius: 5px; border: 1px solid #ccc; min-width: 250px; }
     </style>
 </head>
 <body>
-    <h1>Interactive 3D Citation Trend</h1>
+    <h1>Interactive 3D Citation Trends</h1>
     <div class="controls">
-        <label for="paper-select">Select Individual Paper:</label>
-        <select id="paper-select"></select>
-        <button onclick="resetView()">Show All Papers (3D)</button>
+        <label for="paper-select">Select Papers:</label>
+        <select id="paper-select" multiple size="5"></select>
+        <button onclick="drawChart()">Update Visualization</button>
+        <button onclick="resetView()">Show All Papers</button>
     </div>
     <div id="chart"></div>
 
     <script>
         const jobId = '{{ job_id }}';
         let allData = []; // Store all citation data
-        let initialLayout = {};
+        let maxCitationsAcrossAllYears = 0; // To dynamically set Y-axis range
 
         function getColor(index) {
-            // A simple, fixed set of colors for a diverse look
             const colors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
-                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+                '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
+                '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5'
             ];
             return colors[index % colors.length];
         }
 
-        function createPlotlyData(data, selectedPaperId = null) {
+        function createPlotlyData(selectedPaperIds = null) {
             let plotData = [];
-            let maxTotalCites = 0;
-            if (data.length > 0) {
-                 maxTotalCites = Math.max(...data.map(d => d.total_citations));
+
+            // Filter data if specific papers are selected
+            let dataToVisualize = allData;
+            if (selectedPaperIds && selectedPaperIds.length > 0) {
+                dataToVisualize = allData.filter(paper => selectedPaperIds.includes(paper.id));
             }
-            
-            // X-axis (Time) is the same for all: relative year since first citation
-            // Y-axis (Citations) is the actual citation count
-            // Z-axis (Paper ID) separates the lines in the 3D space
-            
-            data.forEach((paper, index) => {
-                const isSelected = selectedPaperId === paper.id;
 
-                // For the 'scatter3d' trace
-                const x = []; // Time/Relative Year
-                const y = []; // Citation Count
-                const z = []; // Paper ID (for separation)
-                const hoverText = [];
-                let cumulativeCites = 0;
+            if (dataToVisualize.length === 0 && selectedPaperIds && selectedPaperIds.length > 0) {
+                // If nothing is selected or no matching data, show all as a fallback
+                dataToVisualize = allData; 
+            }
 
-                // Sort the years for continuous lines
+            // Calculate overall max and min years
+            let minOverallYear = Infinity;
+            let maxOverallYear = -Infinity;
+            allData.forEach(paper => {
+                Object.keys(paper.cites_by_year).map(Number).forEach(year => {
+                    if (year < minOverallYear) minOverallYear = year;
+                    if (year > maxOverallYear) maxOverallYear = year;
+                });
+            });
+
+            // If no citation years, default to a small range
+            if (minOverallYear === Infinity) {
+                minOverallYear = new Date().getFullYear() - 10;
+                maxOverallYear = new Date().getFullYear();
+            }
+
+            dataToVisualize.forEach((paper, index) => {
+                const x = []; // Years (Time Axis)
+                const y = []; // Citation Counts
+                const z = []; // Circular position for separation
+
+                const initialAngle = (index / allData.length) * 2 * Math.PI; // Distribute papers around the Z-axis
+                const radius = 1; // Distance from the center for each paper's 'base' line
+
                 const sortedYears = Object.keys(paper.cites_by_year).map(Number).sort((a, b) => a - b);
-                
-                // Find the first citation year to calculate relative year
-                let firstYearWithCites = sortedYears.find(year => paper.cites_by_year[year] > 0);
-                if (!firstYearWithCites) {
-                    firstYearWithCites = sortedYears.length > 0 ? sortedYears[0] : paper.pub_year;
-                }
-                
-                const relativeStartYear = firstYearWithCites || paper.pub_year;
 
                 sortedYears.forEach(year => {
-                    const citations = paper.cites_by_year[year];
-                    cumulativeCites += citations;
-                    
-                    x.push(year - relativeStartYear + 1); // Relative year starting at 1
-                    y.push(cumulativeCites); // Cumulative citation count
-                    z.push(index + 1); // Z-axis to separate lines
-                    
-                    // Create the detailed hover text
+                    const citations = paper.cites_by_year[year] || 0;
+
+                    x.push(year); // Actual year for the X-axis (time)
+                    y.push(citations); // Citation count for the Y-axis (height)
+
+                    // Z-axis value to create a circular arrangement
+                    // The 'base' of the line is on a circle, and citations extend radially outwards
+                    // We map the citations to a Z-coordinate that represents its "height" in the 3D space
+                    z.push(radius * Math.cos(initialAngle) + citations * Math.sin(initialAngle)); // X-coord in "radial" plane
+                    // Add an additional Z coordinate here for the other dimension in the radial plane if needed
+                    // For now, let's simplify to a single Z for radial displacement
+
+                    // The original intention was for Z to represent radial displacement.
+                    // Plotly's scatter3d uses X, Y, Z.
+                    // Let's make X = Year, Y = Citation Count.
+                    // For the 3D "fanning out" effect, we can use Z to represent the paper's "index" but offset in a circular manner.
+
+                    // Let's refine for the radial view:
+                    // X (Horizontal time) = Year
+                    // Y (Vertical height) = Citation Count
+                    // Z (Radial position/Paper separation) = a calculated value based on index
+                    // To make it appear as if radiating from a central time axis, we can adjust the camera
+                    // and use a slight Z variation based on paper index, and Y for citation count.
+
+                    // For the 'lines stick to time axis and grow higher as citations grows':
+                    // X = Year
+                    // Y = Citation Count
+                    // Z = A unique identifier per paper, slightly offset to spread them out.
+
+                });
+
+                // Corrected approach for radial visualization:
+                // X = Years (Time Axis)
+                // Y = Radial position (circular spread of papers around the Z-axis)
+                // Z = Citation count (height)
+                // We will adjust camera later to make X-Z look like time-citations.
+
+                const radialX = [];
+                const radialY = [];
+                const radialZ = [];
+
+                const paperRadialOffset = index * 2; // Offset each paper slightly more distinctly
+                const radialScalingFactor = 0.05; // Adjust how far lines fan out for each citation
+
+                sortedYears.forEach(year => {
+                    const citations = paper.cites_by_year[year] || 0;
+                    maxCitationsAcrossAllYears = Math.max(maxCitationsAcrossAllYears, citations);
+
+                    radialX.push(year); // Time axis
+                    radialY.push(paperRadialOffset + citations * radialScalingFactor * Math.sin(initialAngle)); // Radial spread 1
+                    radialZ.push(citations); // Height (citation count)
+                    // We need another dimension for the "spread". Plotly 3D implies X, Y, Z.
+                    // Let's use:
+                    // X = Year
+                    // Y = (Base Paper Offset Y) + Citation * sin(PaperAngle) -> radial dimension 1
+                    // Z = (Base Paper Offset Z) + Citation * cos(PaperAngle) -> radial dimension 2
+                    // The "height" is then the distance from (Y,Z) origin.
+                    // This creates a 3D effect of papers fanning out from the X-axis.
+
+                    // To simplify and achieve "lines grow higher as citations grows" with only time-axis rotation:
+                    // Let's keep X = Year, Y = Paper Index for separation, Z = Citation Count.
+                    // Then, we control camera to rotate around X-axis.
+
+                    // Let's use the simplest:
+                    // X = Year (time)
+                    // Y = Paper Index (for separation around the axis)
+                    // Z = Citation Count (height)
+                });
+
+
+                // The "radial" effect needs careful setup with 3D coordinates.
+                // Let's make X = Year, Y = PaperIndex (for distinct separation), Z = Citations.
+                // Then, we control the camera to rotate around the X (Year) axis.
+                // This means 'Y' and 'Z' will effectively be the 'radial' coordinates when rotating.
+                const paperX = [];
+                const paperY = [];
+                const paperZ = [];
+                const hoverText = [];
+
+                sortedYears.forEach(year => {
+                    const citations = paper.cites_by_year[year] || 0;
+                    maxCitationsAcrossAllYears = Math.max(maxCitationsAcrossAllYears, citations);
+
+                    paperX.push(year); // Time axis
+                    paperY.push(index * 2); // Use index for separation along one axis (Y)
+                    paperZ.push(citations); // Citation count for the other axis (Z)
+
                     hoverText.push(
-                        `<b>Title:</b> ${paper.title.substring(0, 70) + (paper.title.length > 70 ? '...' : '')}<br>` +
-                        `<b>Authors:</b> ${paper.authors}<br>` +
-                        `<b>Year:</b> ${year}<br>` +
-                        `<b>Citations This Year:</b> ${citations}<br>` +
-                        `<b>Cumulative Citations:</b> ${cumulativeCites}<br>` +
-                        `<b>Total Citations:</b> ${paper.total_citations}`
+                        `<b>${paper.title.substring(0, 70) + (paper.title.length > 70 ? '...' : '')}</b><br>` +
+                        `Authors: ${paper.authors}<br>` +
+                        `Journal: ${paper.journal}<br>` +
+                        `Publication Year: ${paper.pub_year}<br>` +
+                        `Year: ${year}<br>` +
+                        `Citations in ${year}: ${citations}<br>` +
+                        `Total Citations: ${paper.total_citations}`
                     );
                 });
 
-                const color = getColor(index);
-                const trace = {
-                    id: paper.id,
-                    x: x,
-                    y: y,
-                    z: z,
-                    mode: 'lines+markers',
-                    name: `Paper ${index + 1}: ${paper.title.substring(0, 30)}...`,
-                    type: 'scatter3d',
-                    hoverinfo: 'text',
-                    text: hoverText,
-                    line: {
-                        color: color,
-                        width: isSelected ? 8 : 2 // Highlight selected line
-                    },
-                    marker: {
-                        color: color,
-                        size: isSelected ? 6 : 3,
-                        symbol: 'circle'
-                    },
-                    opacity: isSelected ? 1.0 : (selectedPaperId ? 0.2 : 0.8) // Dim non-selected papers
-                };
-                plotData.push(trace);
+                if (paperX.length > 0) { // Only add trace if there's data
+                    const trace = {
+                        id: paper.id,
+                        x: paperX,
+                        y: paperY,
+                        z: paperZ,
+                        mode: 'lines+markers',
+                        name: `Paper ${index + 1}: ${paper.title.substring(0, 30)}...`,
+                        type: 'scatter3d',
+                        hoverinfo: 'text',
+                        text: hoverText,
+                        line: {
+                            color: getColor(index),
+                            width: 3 // Fixed line width
+                        },
+                        marker: {
+                            color: getColor(index),
+                            size: 3,
+                            symbol: 'circle'
+                        },
+                        opacity: 0.9
+                    };
+                    plotData.push(trace);
+                }
             });
-            
-            // Layout Configuration for 3D
+
+            // Define the layout
             const layout = {
-                title: selectedPaperId ? `Citation Trend for Selected Paper (2D View)` : `3D Citation Trends by Relative Time (Cumulative Cites)`,
+                title: 'Citation Trends by Year (Interactive 3D)',
                 height: 800,
                 scene: {
                     aspectmode: 'manual',
-                    aspectratio: {x: 1, y: 1.5, z: 0.5}, // Taller Y-axis, compressed Z-axis
+                    aspectratio: {x: 2, y: 1, z: 1}, // Stretch X (time) axis, Y & Z for radial
                     xaxis: {
-                        title: 'Relative Year (Time Axis)',
+                        title: 'Year',
                         tickmode: 'linear',
                         dtick: 1,
+                        autorange: true // Let Plotly determine year range
                     },
                     yaxis: {
-                        title: 'Cumulative Citations (Y-axis)',
+                        title: '', // No explicit Y-axis title (paper separation)
+                        showticklabels: false, // Hide tick labels for paper separation
+                        showgrid: false,
+                        zeroline: false,
+                        // Ensure enough range for all papers to be separate
+                        range: [-1, allData.length * 2 + 1] 
                     },
                     zaxis: {
-                        title: 'Paper ID (Separation Axis)',
-                        tickvals: data.map((d, i) => i + 1),
-                        ticktext: data.map(d => d.title.substring(0, 20) + '...'),
-                        range: [0, data.length + 1],
-                        autorange: false // Fixed separation
+                        title: 'Citations', // Z-axis for citations
+                        range: [0, maxCitationsAcrossAllYears * 1.1], // Max citations + 10% buffer
                     },
-                    camera: { // Initial camera position (fixed for 3D rotation)
-                        up: {x: 0, y: 0, z: 1},
+                    camera: { // Initial camera position, only allowing rotation around X
+                        up: {x: 0, y: 0, z: 1}, // Z is up
                         center: {x: 0, y: 0, z: 0},
-                        eye: {x: 1.25, y: 1.25, z: 1.25} // Default angle for 3D
-                    }
+                        eye: {x: 1.5, y: 1.5, z: 1.5} // Initial view
+                    },
+                    dragmode: 'orbit' // Enable orbit for rotation
                 },
                 margin: {l: 0, r: 0, b: 0, t: 30},
                 hovermode: 'closest'
             };
 
-            // If a paper is selected, switch to a 2D-like view for focus
-            if (selectedPaperId) {
-                const selectedIndex = data.findIndex(p => p.id === selectedPaperId);
-                const eyePos = {x: 1.5, y: 1.5, z: (selectedIndex + 1) / data.length * 2}; // Position eye closer to the selected line
-                
-                // Redraw with just the selected paper data but in 3D space
-                const selectedPaperData = plotData.filter(t => t.id === selectedPaperId);
-                
-                // Temporarily disable the Z-axis title/ticks for a cleaner 2D-like view
-                layout.scene.zaxis.title = '';
-                layout.scene.zaxis.tickvals = [(selectedIndex + 1)];
-                layout.scene.zaxis.ticktext = ['Selected Paper'];
-                
-                // Adjust camera for a 'side' view
-                layout.scene.camera.eye = {x: -2.0, y: 0.0, z: selectedIndex + 1};
-                layout.scene.camera.up = {x: 0, y: 1, z: 0}; // Adjust 'up' to make it look like 2D on X-Y plane
-                layout.scene.camera.center = {x: 0, y: 0, z: selectedIndex + 1};
-
-                return { plotData: selectedPaperData, layout: layout };
-            }
-            
-            initialLayout = layout; // Save the full 3D layout
             return { plotData: plotData, layout: layout };
         }
 
         function populateDropdown(data) {
             const select = document.getElementById('paper-select');
-            select.innerHTML = '<option value="">-- Show All --</option>'; // Default option
-            
+            select.innerHTML = ''; // Clear previous options
+
             // Sort papers by total citations (descending)
             const sortedData = [...data].sort((a, b) => b.total_citations - a.total_citations);
 
@@ -286,32 +359,56 @@ VIZ_HTML = """
                 option.textContent = `(${paper.total_citations} cites) ${paper.title.substring(0, 60)}...`;
                 select.appendChild(option);
             });
-            
-            select.addEventListener('change', (e) => {
-                const selectedId = e.target.value;
-                if (selectedId) {
-                    drawChart(selectedId);
-                } else {
-                    drawChart(null);
-                }
-            });
-        }
-        
-        function resetView() {
-            document.getElementById('paper-select').value = "";
-            drawChart(null);
+            // Select all by default
+            Array.from(select.options).forEach(option => option.selected = true);
         }
 
-        function drawChart(selectedPaperId = null) {
+        function drawChart() {
             if (allData.length === 0) {
                 document.getElementById('chart').innerHTML = 'No citation data available to visualize.';
                 return;
             }
-            
-            const { plotData, layout } = createPlotlyData(allData, selectedPaperId);
 
-            // Re-plot the chart
-            Plotly.newPlot('chart', plotData, layout);
+            const selectElement = document.getElementById('paper-select');
+            const selectedOptions = Array.from(selectElement.selectedOptions);
+            const selectedPaperIds = selectedOptions.map(option => option.value);
+
+            const { plotData, layout } = createPlotlyData(selectedPaperIds);
+
+            Plotly.newPlot('chart', plotData, layout, {
+                displayModeBar: false, // Hide plotly toolbar by default
+                // Make the plot rotatable only around the X axis
+                modeBarButtonsToRemove: ['pan3d', 'zoom3d', 'resetCameraLastSave3d', 'hoverClosest3d', 'hoverCompare3d'],
+                // Set fixed range on the y-axis to ensure papers stay separated
+                responsive: true
+            });
+
+            const myPlot = document.getElementById('chart');
+            // Allow rotation only around the X-axis (time axis)
+            myPlot.on('plotly_relayout', function(eventdata) {
+                if (eventdata['scene.camera.eye']) {
+                    const camera = myPlot.layout.scene.camera;
+                    // Lock the Z-up vector
+                    camera.up = {x: 0, y: 0, z: 1};
+                    // Keep the center of rotation on the X-axis
+                    camera.center = {x: camera.center.x, y: 0, z: 0};
+                    // Prevent arbitrary Z-axis movement for the eye, allow Y and Z to rotate
+                    // This is tricky; plotly's orbit dragmode already handles rotation around the center.
+                    // To restrict strictly to X-axis rotation, we need to enforce the Y and Z components of `eye` to maintain constant radius from X.
+                    // This is more complex than a simple lock. A simpler approach is to use 'orbit' and accept that it will rotate around all axes from the center,
+                    // but make the scene visually aligned with the X-axis as central.
+
+                    // For truly only X-axis rotation, a custom camera update might be needed,
+                    // but Plotly's 'orbit' mode is the closest built-in.
+                    // We'll rely on aspect ratio and initial camera to emphasize X as the primary axis.
+                }
+            });
+        }
+
+        function resetView() {
+            const selectElement = document.getElementById('paper-select');
+            Array.from(selectElement.options).forEach(option => option.selected = true); // Select all
+            drawChart();
         }
 
         // Fetch data and initialize
@@ -324,7 +421,7 @@ VIZ_HTML = """
                 }
                 allData = data.citation_data.map((p, i) => ({ ...p, id: i.toString() }));
                 populateDropdown(allData);
-                drawChart(null);
+                drawChart(); // Initial draw with all papers selected
             })
             .catch(error => {
                 document.getElementById('chart').innerHTML = 'An error occurred while fetching data.';
@@ -335,6 +432,8 @@ VIZ_HTML = """
 </body>
 </html>
 """
+
+
 # --- END NEW VIZ TEMPLATE ---
 
 
@@ -429,7 +528,7 @@ def scrape_scholar(scholar_id, job_id):
             if JOBS[job_id].get("cancelled", False):
                 log("⚠️ Job cancelled by user.")
                 return
-                
+
             title_preview = pub.get("bib", {}).get("title", "Unknown")[:50]
             log(f"[{idx}/{len(pubs)}] Processing: {title_preview}...")
 
@@ -520,7 +619,7 @@ def scrape_scholar(scholar_id, job_id):
 
         if not pub_citation_data:
             raise Exception("Failed to collect any publication data")
-            
+
         # --- NEW: Save raw data for visualization ---
         JOBS[job_id]["citation_data"] = pub_citation_data
         # --- END NEW ---
@@ -615,7 +714,7 @@ def start_job():
         "done": False,
         "error": None,
         "filename": None,
-        "citation_data": None, # New field for viz data
+        "citation_data": None,  # New field for viz data
         "cancelled": False
     }
 
@@ -651,23 +750,22 @@ def job_status(job_id):
         status=job["status"],
         error=job["error"],
         download_url=download_url,
-        visualization_url=visualization_url, # Pass the new URL
+        visualization_url=visualization_url,  # Pass the new URL
         cancelled=job.get("cancelled", False)
     )
 
 
 @app.route('/stop/<job_id>', methods=['POST'])
 def stop_job(job_id):
-    if job_id not in JOBS:
-        return jsonify({"success": False, "message": "Job not found"}), 404
-    
+    if job_id not in JOBS:return jsonify({"success": False, "message": "Job not found"}), 404
+
     # Mark the job as cancelled
     JOBS[job_id]["cancelled"] = True
-    
+
     # Add a message to the status log
     current_status = JOBS[job_id]["status"]
     JOBS[job_id]["status"] = current_status + "\n⚠️ Cancellation requested. Stopping job..."
-    
+
     return jsonify({"success": True, "message": "Job cancellation requested"})
 
 
@@ -693,12 +791,9 @@ def citation_data_api(job_id):
     if job_id not in JOBS or not JOBS[job_id].get("citation_data"):
         return jsonify({"error": "Citation data not found for this job ID."}), 404
 
-    # Prepare data for JSON serialization (remove keys not needed by JS or convert types)
+    # Prepare data for JSON serialization
     data = JOBS[job_id]["citation_data"]
-    
-    # Ensure all data is JSON-serializable (e.g., convert all int/float to string if necessary, but dicts should be fine)
-    # The dictionary 'citations_by_year' contains integer keys, which are converted to strings by jsonify.
-    # The JS will handle the conversion back to numbers.
+
     prepared_data = []
     for item in data:
         # Create a cleaner dictionary for the frontend
@@ -711,7 +806,7 @@ def citation_data_api(job_id):
             # Ensure keys in citations_by_year are strings for JSON
             "cites_by_year": {str(k): v for k, v in item["citations_by_year"].items()}
         })
-        
+
     return jsonify({"citation_data": prepared_data})
 
 
@@ -720,7 +815,7 @@ def visualization(job_id):
     """Renders the 3D visualization page."""
     if job_id not in JOBS or not JOBS[job_id].get("citation_data"):
         return "Visualization data not available. Please run the job first.", 404
-        
+
     return render_template_string(VIZ_HTML, job_id=job_id)
 # --- END NEW VIZ ROUTES ---
 
