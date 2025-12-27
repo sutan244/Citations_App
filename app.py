@@ -12,6 +12,7 @@ MODIFICATIONS:
 - Multi-author Excel: Year 1 for each author corresponds to that author's own start year.
 - Single Scholar Viz: Now allows checkbox selection of multiple specific papers.
 - Multi Scholar Viz: Now includes a toggle to compare citations from UTD Full Articles only.
+- UTD Detection: Now uses UTDRankingScraper to match papers against UTD database by author and title.
 """
 import os
 import time
@@ -20,8 +21,21 @@ import threading
 import uuid
 import pandas as pd
 import urllib.parse
+import re
+import json
+from difflib import SequenceMatcher
 from scholarly import scholarly
 from flask import Flask, request, render_template_string, redirect, url_for, send_file, jsonify
+import requests
+from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Tuple
+import logging
+import warnings
+import urllib3
+
+# Disable SSL warnings for UTD scraper
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings('ignore')
 
 # --- Configuration & Setup ---
 app = Flask(__name__)
@@ -35,33 +49,491 @@ JOBS = {}
 DELAY_MIN = 0.6
 DELAY_MAX = 1.4
 
-# UTD 24 Journal List (lowercase for comparison)
-UTD_24_JOURNALS = {
-    "the accounting review",
-    "journal of accounting and economics",
-    "journal of accounting research",
-    "journal of finance",
-    "journal of financial economics",
-    "the review of financial studies",
-    "information systems research",
-    "journal on computing",
-    "mis quarterly",
-    "journal of consumer research",
-    "journal of marketing",
-    "journal of marketing research",
-    "marketing science",
-    "management science",
-    "operations research",
-    "journal of operations management",
-    "manufacturing and service operations management",
-    "production and operations management",
-    "academy of management journal",
-    "academy of management review",
-    "administrative science quarterly",
-    "organization science",
-    "journal of international business studies",
-    "strategic management journal"
-}
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# --- UTD Crawler Classes ---
+
+class GoogleScholarParser:
+    """Parser for extracting author names from Google Scholar profiles"""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.verify = False
+
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+        })
+
+    def extract_author_name(self, google_scholar_url: str) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            time.sleep(2)
+            response = self.session.get(google_scholar_url, timeout=30)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            title_tag = soup.find('title')
+            if title_tag:
+                title_text = title_tag.text.strip()
+                clean_title = title_text.replace('\u202a', '').replace('\u202c', '').strip()
+
+                if ' - ' in clean_title:
+                    name_part = clean_title.split(' - ')[0]
+                elif ' – ' in clean_title:
+                    name_part = clean_title.split(' – ')[0]
+                else:
+                    name_part = clean_title.split('-')[0] if '-' in clean_title else clean_title
+
+                name_parts = name_part.strip().split()
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    last_name = name_parts[-1]
+                    return first_name, last_name
+
+            possible_selectors = [
+                'div#gsc_prf_in',
+                'div.gsc_prf_il',
+                'h1.gsc_prf_il',
+                'div#gsc_prf_w',
+                'meta[name="author"]',
+                'meta[property="og:title"]'
+            ]
+
+            for selector in possible_selectors:
+                element = soup.select_one(selector)
+                if element:
+                    content = element.get('content', element.text).strip()
+                    if content and len(content.split()) >= 2:
+                        name_parts = content.split()
+                        first_name = name_parts[0]
+                        last_name = name_parts[-1]
+                        return first_name, last_name
+
+            return None, None
+
+        except Exception as e:
+            logger.error(f"Error extracting author name: {e}")
+            return None, None
+
+
+class UTDRankingScraper:
+    """Scraper for UTD Top 100 Business School Research Rankings database"""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.verify = False
+        self.base_url = "https://jsom.utdallas.edu/the-utd-top-100-business-school-research-rankings"
+
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+
+        self.all_journal_ids = [
+            28, 27, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13,
+            12, 11, 10, 8, 7, 5, 4, 3, 2, 1
+        ]
+
+    def _get_best_match_id(self, data_list: List[Dict], search_name: str) -> Optional[str]:
+        if not data_list:
+            return None
+
+        exact_matches = []
+        for item in data_list:
+            if item['name'].strip() == search_name.strip():
+                exact_matches.append(item)
+
+        if exact_matches:
+            return exact_matches[0]['value']
+        else:
+            return data_list[0]['value']
+
+    def get_author_ids(self, last_name: str, first_name: str) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            search_url = f"{self.base_url}/search"
+            self.session.get(search_url, timeout=30)
+            time.sleep(1)
+
+            last_name_params = {
+                'q': last_name,
+                'option': 'getAllAuthorsLastName'
+            }
+
+            response = self.session.get(
+                f"{self.base_url}/application/functions.php",
+                params=last_name_params,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                return None, None
+
+            try:
+                last_name_data = response.json()
+            except json.JSONDecodeError:
+                return None, None
+
+            if not last_name_data:
+                return None, None
+
+            last_name_id = self._get_best_match_id(last_name_data, last_name)
+            if not last_name_id:
+                return None, None
+
+            time.sleep(1)
+
+            first_name_params = {
+                'q': first_name,
+                'option': 'getAllAuthorsFirstName'
+            }
+
+            response = self.session.get(
+                f"{self.base_url}/application/functions.php",
+                params=first_name_params,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                return last_name_id, None
+
+            try:
+                first_name_data = response.json()
+            except json.JSONDecodeError:
+                return last_name_id, None
+
+            if not first_name_data:
+                return last_name_id, None
+
+            first_name_id = self._get_best_match_id(first_name_data, first_name)
+            if not first_name_id:
+                return last_name_id, None
+
+            return last_name_id, first_name_id
+
+        except Exception as e:
+            logger.error(f"Error getting author IDs: {e}")
+            return None, None
+
+    def search_publications(
+            self,
+            last_name_id: str,
+            first_name_id: str,
+            start_year: int = 1990,
+            end_year: int = 2025,
+            journal_ids: Optional[List[int]] = None
+    ) -> Dict:
+        if journal_ids is None:
+            journal_ids = self.all_journal_ids
+
+        form_data = {
+            'option': 'loadSearchResults',
+            'id': '3',
+            'frmDate': str(start_year),
+            'toDate': str(end_year),
+            'journal_ids': ','.join(str(id) for id in journal_ids) + ',',
+            'lastNameVal': f"{last_name_id},",
+            'firstNameVal': f"{first_name_id},",
+            'applyAnd': '0'
+        }
+
+        post_headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Referer': f'{self.base_url}/search',
+            'Origin': 'https://jsom.utdallas.edu'
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/application/functions.php",
+                data=form_data,
+                headers=post_headers,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                return {
+                    'status': 'error',
+                    'message': f'HTTP {response.status_code}',
+                    'total': 0,
+                    'articles': []
+                }
+
+            return self._parse_search_results(response.text)
+
+        except Exception as e:
+            logger.error(f"Search request failed: {e}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'total': 0,
+                'articles': []
+            }
+
+    def _parse_search_results(self, html_content: str) -> Dict:
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            articles = []
+
+            rows = soup.find_all('tr')
+
+            for row in rows:
+                cells = row.find_all('td')
+
+                if len(cells) >= 5:
+                    article = {}
+
+                    journal_cell = cells[0]
+                    journal_label = journal_cell.find('label')
+                    article['journal'] = journal_label.text.strip() if journal_label else journal_cell.get_text(
+                        strip=True)
+
+                    title_cell = cells[1]
+                    title_label = title_cell.find('label')
+                    article['article'] = title_label.text.strip() if title_label else title_cell.get_text(strip=True)
+
+                    author_cell = cells[2]
+                    author_label = author_cell.find('label')
+                    if author_label:
+                        ul = author_label.find('ul')
+                        if ul:
+                            authors = []
+                            for li in ul.find_all('li'):
+                                author_text = li.get_text(strip=True)
+                                if ' - ' in author_text:
+                                    author_name = author_text.split(' - ')[0]
+                                else:
+                                    author_name = author_text
+                                authors.append(author_name)
+                            article['authors'] = '; '.join(authors)
+                        else:
+                            article['authors'] = author_label.get_text(strip=True)
+                    else:
+                        article['authors'] = author_cell.get_text(strip=True)
+
+                    year_cell = cells[3]
+                    year_label = year_cell.find('label')
+                    article['year'] = year_label.text.strip() if year_label else year_cell.get_text(strip=True)
+
+                    volume_cell = cells[4]
+                    volume_label = volume_cell.find('label')
+                    article['volume'] = volume_label.text.strip() if volume_label else volume_cell.get_text(strip=True)
+
+                    articles.append(article)
+
+            total_match = re.search(r'Total.*?(\d+)', html_content, re.IGNORECASE)
+            if total_match:
+                total = int(total_match.group(1))
+            else:
+                total = len(articles)
+
+            return {
+                'status': 'success',
+                'total': total,
+                'articles': articles
+            }
+
+        except Exception as e:
+            logger.error(f"Error parsing search results: {e}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'total': 0,
+                'articles': []
+            }
+
+    def search_by_author_name(
+            self,
+            last_name: str,
+            first_name: str,
+            start_year: int = 1990,
+            end_year: int = 2025
+    ) -> Dict:
+        last_name_id, first_name_id = self.get_author_ids(last_name, first_name)
+
+        if not last_name_id or not first_name_id:
+            return {
+                'status': 'error',
+                'message': f'Cannot find author {first_name} {last_name}',
+                'author': {
+                    'last_name': last_name,
+                    'first_name': first_name,
+                    'last_name_id': None,
+                    'first_name_id': None
+                },
+                'total': 0,
+                'articles': []
+            }
+
+        results = self.search_publications(
+            last_name_id=last_name_id,
+            first_name_id=first_name_id,
+            start_year=start_year,
+            end_year=end_year
+        )
+
+        results['author'] = {
+            'last_name': last_name,
+            'first_name': first_name,
+            'last_name_id': last_name_id,
+            'first_name_id': first_name_id
+        }
+
+        return results
+
+
+# --- Global UTD Scraper Instance ---
+_UTD_SCRAPER = None
+_UTD_CACHE = {}  # Cache UTD results per author to avoid repeated lookups
+
+def get_utd_scraper():
+    """Get or create shared UTD scraper instance"""
+    global _UTD_SCRAPER
+    if _UTD_SCRAPER is None:
+        try:
+            _UTD_SCRAPER = UTDRankingScraper()
+        except Exception as e:
+            logger.error(f"Failed to initialize UTD scraper: {e}")
+            _UTD_SCRAPER = None
+    return _UTD_SCRAPER
+
+
+def _norm(s):
+    """Normalize string for comparison"""
+    if not s:
+        return ""
+    return re.sub(r'\s+', ' ', str(s)).strip().lower()
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Calculate similarity between two titles"""
+    if not a or not b:
+        return 0.0
+    a = _norm(a)
+    b = _norm(b)
+    # Direct substring match
+    if a in b or b in a:
+        return 1.0
+    # Sequence matcher ratio
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def fetch_utd_articles_for_author(first_name: str, last_name: str) -> List[Dict]:
+    """
+    Fetch all UTD articles for a given author and cache results.
+    Returns list of UTD article dictionaries.
+    """
+    global _UTD_CACHE
+    cache_key = f"{first_name}_{last_name}".lower()
+
+    if cache_key in _UTD_CACHE:
+        return _UTD_CACHE[cache_key]
+
+    try:
+        scraper = get_utd_scraper()
+        if not scraper:
+            _UTD_CACHE[cache_key] = []
+            return []
+
+        current_year = int(time.strftime("%Y"))
+        results = scraper.search_by_author_name(
+            last_name=last_name,
+            first_name=first_name,
+            start_year=1990,
+            end_year=current_year
+        )
+
+        if results.get("status") == "success" and results.get("articles"):
+            articles = results.get("articles", [])
+            _UTD_CACHE[cache_key] = articles
+            logger.info(f"Fetched {len(articles)} UTD articles for {first_name} {last_name}")
+            return articles
+        else:
+            _UTD_CACHE[cache_key] = []
+            return []
+
+    except Exception as e:
+        logger.error(f"Error fetching UTD articles for {first_name} {last_name}: {e}")
+        _UTD_CACHE[cache_key] = []
+        return []
+
+
+def find_utd_match(pub_title: str, pub_authors: str, pub_year: Optional[int], utd_articles: List[Dict]) -> Tuple[bool, bool, Optional[dict]]:
+    """
+    Match a Google Scholar publication against pre-fetched UTD articles.
+    Returns (is_utd_journal, is_full_article, matched_utd_record_or_None).
+
+    Args:
+        pub_title: Publication title from Google Scholar
+        pub_authors: Authors string from Google Scholar
+        pub_year: Publication year
+        utd_articles: Pre-fetched list of UTD articles for this author
+    """
+    if not utd_articles:
+        return False, False, None
+
+    try:
+        best = None
+        best_score = 0.0
+
+        for art in utd_articles:
+            art_title = art.get("article") or art.get("title") or ""
+            sim = _title_similarity(pub_title, art_title)
+
+            # Year check
+            art_year = None
+            try:
+                art_year = int(str(art.get("year", "")).strip())
+            except Exception:
+                art_year = None
+
+            year_score = 0.0
+            if pub_year and art_year:
+                year_score = 1.0 if abs(pub_year - art_year) <= 1 else 0.0
+
+            # Combine scores, weight title higher
+            score = sim * 0.8 + year_score * 0.2
+
+            if score > best_score:
+                best_score = score
+                best = art
+
+        # Heuristic thresholds for matching
+        if best and (best_score >= 0.85 or
+                    (best_score >= 0.6 and
+                     (_norm(pub_title) in _norm(best.get("article", "")) or
+                      _norm(best.get("article", "")) in _norm(pub_title)))):
+            # Treat as UTD journal match
+            # UTD database lists full articles in top journals
+            return True, True, best
+
+        return False, False, None
+
+    except Exception as e:
+        logger.error(f"Error matching UTD article: {e}")
+        return False, False, None
+
 
 # --- HTML Templates ---
 HTML = """
@@ -543,59 +1015,48 @@ def extract_scholar_id(id_or_url):
     return id_or_url
 
 
-def normalize_journal_name(raw):
-    """Strip URLs/DOIs and extraneous whitespace, lowercase."""
-    if not raw:
-        return ""
-    s = str(raw)
-    for sep in ['http://', 'https://', 'doi:', 'doi.org', 'dx.doi.org']:
-        if sep in s.lower():
-            parts = s.lower().split(sep, 1)
-            s = parts[0]
-            break
-    s = s.strip().strip(',').strip()
-    return s
+def extract_author_first_last_name(authors_string: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract first and last name from an authors string.
+    Typically the first author is used for UTD lookup.
+    """
+    if not authors_string:
+        return None, None
 
+    # Split by common delimiters
+    first_author = authors_string.split(';')[0].split(',')[0].strip()
 
-def check_utd_journal(journal_name, pages_field=None):
-    is_utd = False
-    is_full_article = False
+    # Remove common prefixes and suffixes
+    first_author = re.sub(r'\s+', ' ', first_author).strip()
 
-    try:
-        norm = normalize_journal_name(journal_name).lower()
-    except Exception:
-        norm = ""
+    parts = first_author.split()
+    if len(parts) >= 2:
+        # Assume format: "FirstName LastName" or "F. LastName"
+        first_name = parts[0].replace('.', '').strip()
+        last_name = parts[-1].strip()
+        return first_name, last_name
+    elif len(parts) == 1:
+        # Only one name part
+        return None, parts[0].strip()
 
-    if norm:
-        for utd in UTD_24_JOURNALS:
-            if utd in norm or norm in utd:
-                is_utd = True
-                break
-
-    if pages_field:
-        try:
-            pages_str = str(pages_field).replace(' ', '').replace('.', '').replace(',', '')
-            if '-' in pages_str:
-                start_page_str, end_page_str = pages_str.split('-', 1)
-                start = int(start_page_str)
-                end = int(end_page_str)
-                if end - start >= 6:
-                    is_full_article = True
-        except Exception:
-            pass
-
-    return is_utd, is_full_article
+    return None, None
 
 
 # --- Scraping helpers used by single and multi jobs ---
 
-def process_author_publications(author_obj, job, job_id):
+def process_author_publications(author_obj, job, job_id, author_name_for_utd=None):
     """
     Given a scholarly author object (partially filled), process publications similarly
     to single-author flow and return:
       - pub_citation_list of per-publication dicts
       - total_utd_full_articles, total_utd_journal_pubs
       - all_citation_years (set)
+
+    Args:
+        author_obj: Scholarly author object
+        job: Job dictionary for status tracking
+        job_id: Job ID string
+        author_name_for_utd: Tuple of (first_name, last_name) for UTD lookup, or None to extract from first publication
     """
     pub_citation_data = []
     total_utd_full_articles = 0
@@ -603,6 +1064,15 @@ def process_author_publications(author_obj, job, job_id):
     all_citation_years = set()
 
     pubs = author_obj.get("publications", []) or []
+
+    # Fetch UTD articles once for this author
+    utd_articles = []
+    if author_name_for_utd:
+        first_name, last_name = author_name_for_utd
+        if first_name and last_name:
+            utd_articles = fetch_utd_articles_for_author(first_name, last_name)
+            if job and job_id:
+                job["status"] = job.get("status", "") + f"\nFetched {len(utd_articles)} UTD articles for matching."
 
     for pub_idx, pub in enumerate(pubs, start=1):
         if job.get("cancelled", False):
@@ -624,13 +1094,25 @@ def process_author_publications(author_obj, job, job_id):
         total_cites = pub_filled.get("num_citations") or pub_filled.get("citedby") or 0
         pages = extract_from_bib(bib, ["pages"], "")
 
-        is_utd_journal, is_full_article = check_utd_journal(journal, pages)
-        utd_flag = 1 if is_full_article else 0
+        # Use UTD remote lookup & title-based matching to determine UTD match
+        try:
+            pub_year_int = None
+            try:
+                pub_year_int = int(pub_year) if pub_year else None
+            except Exception:
+                pub_year_int = None
 
-        if is_utd_journal:
-            total_utd_journal_pubs += 1
-        if is_full_article and is_utd_journal:
-            total_utd_full_articles += 1
+            utd_match_journal, utd_match_full, matched_utd = find_utd_match(title, authors, pub_year_int, utd_articles)
+            utd_flag = 1 if utd_match_full else 0
+
+            if utd_match_full and utd_match_journal:
+                total_utd_full_articles += 1
+                total_utd_journal_pubs += 1
+
+        except Exception as e:
+            logger.error(f"Error matching UTD for paper '{title}': {e}")
+            utd_flag = 0
+            utd_match_journal = False
 
         citations_by_year = get_cites_per_year(pub_filled)
         all_citation_years.update(citations_by_year.keys())
@@ -652,7 +1134,7 @@ def process_author_publications(author_obj, job, job_id):
             "total_citations": int(total_cites) if total_cites else 0,
             "start_year": start_year,
             "cites_by_year": citations_by_year,
-            "utd_journal": "Yes" if is_utd_journal else "No",
+            "utd_journal": "Yes" if utd_match_journal else "No",
             "utd_full_article": utd_flag,
         }
         pub_citation_data.append(pub_data)
@@ -660,8 +1142,7 @@ def process_author_publications(author_obj, job, job_id):
 
     return pub_citation_data, total_utd_full_articles, total_utd_journal_pubs, all_citation_years
 
-
-# --- Main Scraping Logic (single-scholar only, unchanged) ---
+# --- Main Scraping Logic (single-scholar only) ---
 
 def scrape_scholar(scholar_id, job_id):
     logs = []
@@ -705,9 +1186,13 @@ def scrape_scholar(scholar_id, job_id):
             JOBS[job_id]["error"] = "No publications found."
             return
 
+        # Extract author name for UTD lookup
+        first_name, last_name = extract_author_first_last_name(author_name)
+        log(f"Extracted name for UTD lookup: {first_name} {last_name}")
+
         # Use shared helper to process publications
         pub_citation_data, total_utd_full_articles, total_utd_journal_pubs, all_citation_years = process_author_publications(
-            author, JOBS[job_id], job_id)
+            author, JOBS[job_id], job_id, author_name_for_utd=(first_name, last_name))
 
         JOBS[job_id]["citation_data"] = pub_citation_data
 
@@ -900,8 +1385,12 @@ def scrape_multiple_authors(list_of_ids, job_id):
                     log(f"  ❌ Failed to fill author: {e}. Skipping.")
                     continue
 
+            # Extract author name for UTD lookup
+            first_name, last_name = extract_author_first_last_name(author_name)
+            log(f"  Extracted name for UTD lookup: {first_name} {last_name}")
+
             pub_citation_data, total_utd_full_articles, total_utd_journal_pubs, all_citation_years = process_author_publications(
-                author, JOBS[job_id], job_id)
+                author, JOBS[job_id], job_id, author_name_for_utd=(first_name, last_name))
 
             if JOBS[job_id].get("cancelled", False):
                 log("⚠️ Job cancelled during publications retrieval.")
